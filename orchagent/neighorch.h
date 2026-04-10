@@ -31,6 +31,12 @@ struct NeighborData
     uint32_t      voq_encap_index = 0;
 };
 
+struct SuppressedNeighborData
+{
+    MacAddress       mac;
+    sai_object_id_t  vrf_id = gVirtualRouterId;
+};
+
 /* NeighborTable: NeighborEntry, neighbor MAC address */
 typedef map<NeighborEntry, NeighborData> NeighborTable;
 /* NextHopTable: NextHopKey, NextHopEntry */
@@ -81,6 +87,8 @@ public:
 
     void resolveNeighbor(const NeighborEntry &);
     void updateSrv6Nexthop(const NextHopKey &, const sai_object_id_t &);
+    void suppressNeighborForLocalIp(const IpAddress&, sai_object_id_t vrf_id);
+    void restoreSuppressedNeighbors(const IpAddress&, sai_object_id_t vrf_id);
 
 private:
     PortsOrch *m_portsOrch;
@@ -119,6 +127,8 @@ private:
     void clearResolvedNeighborEntry(const NeighborEntry &);
 
     bool addZeroMacTunnelRoute(const NeighborEntry &, const MacAddress &);
+
+    std::map<NeighborEntry, SuppressedNeighborData> m_suppressedNeighbors;
 };
 
 #endif /* SWSS_NEIGHORCH_H */

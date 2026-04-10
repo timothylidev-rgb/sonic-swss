@@ -871,6 +871,8 @@ void NeighOrch::doTask(Consumer &consumer)
         }
         else if (op == DEL_COMMAND)
         {
+            m_suppressedNeighbors.erase(neighbor_entry);
+
             if (m_syncdNeighbors.find(neighbor_entry) != m_syncdNeighbors.end())
             {
                 if (removeNeighbor(neighbor_entry))
@@ -901,6 +903,20 @@ bool NeighOrch::addNeighbor(const NeighborEntry &neighborEntry, const MacAddress
     sai_status_t status;
     IpAddress ip_address = neighborEntry.ip_address;
     string alias = neighborEntry.alias;
+    sai_object_id_t vrf_id = gVirtualRouterId;
+    const auto& syncd_intfs = m_intfsOrch->getSyncdIntfses();
+    auto intf_it = syncd_intfs.find(alias);
+    if (intf_it != syncd_intfs.end())
+    {
+        vrf_id = intf_it->second.vrf_id;
+    }
+
+    if (m_intfsOrch->isLocalAddress(ip_address, vrf_id))
+    {
+        SWSS_LOG_INFO("Skip neighbor %s on %s because local IP has priority in vrf 0x%" PRIx64,
+                      ip_address.to_string().c_str(), alias.c_str(), vrf_id);
+        return false;
+    }
 
     sai_object_id_t rif_id = m_intfsOrch->getRouterIntfsId(alias);
     if (rif_id == SAI_NULL_OBJECT_ID)
@@ -1040,6 +1056,62 @@ bool NeighOrch::addNeighbor(const NeighborEntry &neighborEntry, const MacAddress
     }
 
     return true;
+}
+
+void NeighOrch::suppressNeighborForLocalIp(const IpAddress &ip, sai_object_id_t vrf_id)
+{
+    std::vector<NeighborEntry> toSuppress;
+    const auto& syncd_intfs = m_intfsOrch->getSyncdIntfses();
+
+    for (const auto &it : m_syncdNeighbors)
+    {
+        if (it.first.ip_address != ip)
+        {
+            continue;
+        }
+
+        auto intf_it = syncd_intfs.find(it.first.alias);
+        if (intf_it == syncd_intfs.end() || intf_it->second.vrf_id != vrf_id)
+        {
+            continue;
+        }
+
+        toSuppress.push_back(it.first);
+    }
+
+    for (const auto &neighbor : toSuppress)
+    {
+        m_suppressedNeighbors[neighbor] = {m_syncdNeighbors[neighbor].mac, vrf_id};
+
+        if (!removeNeighbor(neighbor))
+        {
+            SWSS_LOG_WARN("Failed to suppress neighbor %s on %s for local IP conflict",
+                          neighbor.ip_address.to_string().c_str(), neighbor.alias.c_str());
+        }
+    }
+}
+
+void NeighOrch::restoreSuppressedNeighbors(const IpAddress &ip, sai_object_id_t vrf_id)
+{
+    for (auto it = m_suppressedNeighbors.begin(); it != m_suppressedNeighbors.end();)
+    {
+        if (it->first.ip_address != ip || it->second.vrf_id != vrf_id)
+        {
+            ++it;
+            continue;
+        }
+
+        if (addNeighbor(it->first, it->second.mac))
+        {
+            SWSS_LOG_NOTICE("Restored suppressed neighbor %s on %s after local IP removal",
+                            it->first.ip_address.to_string().c_str(), it->first.alias.c_str());
+            it = m_suppressedNeighbors.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
 }
 
 bool NeighOrch::removeNeighbor(const NeighborEntry &neighborEntry, bool disable)
@@ -1515,6 +1587,8 @@ void NeighOrch::doVoqSystemNeighTask(Consumer &consumer)
         }
         else if (op == DEL_COMMAND)
         {
+            m_suppressedNeighbors.erase(neighbor_entry);
+
             if (m_syncdNeighbors.find(neighbor_entry) != m_syncdNeighbors.end())
             {
                 //Remove neigh from SAI

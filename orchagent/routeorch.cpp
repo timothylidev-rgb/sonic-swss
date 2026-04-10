@@ -848,6 +848,13 @@ void RouteOrch::doTask(Consumer& consumer)
                     {
                         it = consumer.m_toSync.erase(it);
                     }
+                    /* Local interface IP semantics have priority over host route semantics. */
+                    else if (ip_prefix.isFullMask() && m_intfsOrch->isLocalAddress(ip_prefix.getIp(), vrf_id))
+                    {
+                        SWSS_LOG_INFO("Skip host route %s in vrf 0x%" PRIx64 " because local IP route has priority",
+                                      ip_prefix.to_string().c_str(), vrf_id);
+                        it++;
+                    }
                     /* fullmask subnet route is same as ip2me route */
                     else if (ip_prefix.isFullMask() && m_intfsOrch->isPrefixSubnet(ip_prefix, alsv[0]))
                     {
@@ -1156,6 +1163,36 @@ const NextHopGroupKey RouteOrch::getSyncdRouteNhgKey(sai_object_id_t vrf_id, con
         }
     }
     return nhg;
+}
+
+bool RouteOrch::restoreConflictingHostRoute(sai_object_id_t vrf_id, const IpAddress &ip)
+{
+    IpPrefix ipPrefix(ip.to_string());
+    auto it_route_table = m_syncdRoutes.find(vrf_id);
+    if (it_route_table == m_syncdRoutes.end())
+    {
+        return true;
+    }
+
+    auto it_route = it_route_table->second.find(ipPrefix);
+    if (it_route == it_route_table->second.end())
+    {
+        return true;
+    }
+
+    RouteBulkContext ctx;
+    ctx.vrf_id = vrf_id;
+    ctx.ip_prefix = ipPrefix;
+    ctx.nhg_index = it_route->second.nhg_index;
+
+    const NextHopGroupKey &nhg = it_route->second.nhg_key;
+    if (!addRoute(ctx, nhg))
+    {
+        return false;
+    }
+
+    gRouteBulker.flush();
+    return addRoutePost(ctx, nhg);
 }
 
 bool RouteOrch::createFineGrainedNextHopGroup(sai_object_id_t &next_hop_group_id, vector<sai_attribute_t> &nhg_attrs)
@@ -2553,6 +2590,18 @@ bool RouteOrch::removeRoutePost(const RouteBulkContext& ctx)
         }
 
         gFlowCounterRouteOrch->handleRouteRemove(vrf_id, ipPrefix);
+    }
+
+    /*
+     * Restore IP2ME route when a conflicting host route is removed.
+     * This handles the case where a local-IP route was overwritten by
+     * a regular host route before conflict checks were introduced.
+     */
+    if (ipPrefix.isFullMask() && m_intfsOrch->isLocalAddress(ipPrefix.getIp(), vrf_id))
+    {
+        m_intfsOrch->addIp2MeRoute(vrf_id, ipPrefix);
+        SWSS_LOG_NOTICE("Restored IP2ME route for local address %s in vrf 0x%" PRIx64,
+                        ipPrefix.to_string().c_str(), vrf_id);
     }
 
     return true;

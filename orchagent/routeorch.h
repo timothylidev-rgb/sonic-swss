@@ -220,6 +220,7 @@ public:
     void decreaseNextHopGroupCount();
     bool checkNextHopGroupCount();
     const RouteTables& getSyncdRoutes() const { return m_syncdRoutes; }
+    bool restoreConflictingHostRoute(sai_object_id_t vrf_id, const IpAddress &ip);
 
 private:
     SwitchOrch *m_switchOrch;
