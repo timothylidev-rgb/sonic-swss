@@ -35,6 +35,7 @@ extern CrmOrch *gCrmOrch;
 extern BufferOrch *gBufferOrch;
 extern bool gIsNatSupported;
 extern NeighOrch *gNeighOrch;
+extern RouteOrch *gRouteOrch;
 extern string gMySwitchType;
 extern int32_t gVoqMySwitchId;
 
@@ -132,6 +133,27 @@ bool IntfsOrch::isPrefixSubnet(const IpPrefix &ip_prefix, const string &alias)
             return true;
         }
     }
+    return false;
+}
+
+bool IntfsOrch::isLocalAddress(const IpAddress &ip, sai_object_id_t vrf_id) const
+{
+    for (const auto &intf : m_syncdIntfses)
+    {
+        if (intf.second.vrf_id != vrf_id)
+        {
+            continue;
+        }
+
+        for (const auto &prefix : intf.second.ip_addresses)
+        {
+            if (prefix.getIp() == ip)
+            {
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 
@@ -1355,8 +1377,39 @@ void IntfsOrch::addIp2MeRoute(sai_object_id_t vrf_id, const IpPrefix &ip_prefix)
     attr.value.oid = cpu_port.m_port_id;
     attrs.push_back(attr);
 
+    /*
+     * Neighbor has higher precedence in SAI/ASIC lookup than route.
+     * Remove conflicting neighbor first, so local-IP semantics can win.
+     */
+    gNeighOrch->suppressNeighborForLocalIp(ip_prefix.getIp(), vrf_id);
+
     sai_status_t status = sai_route_api->create_route_entry(&unicast_route_entry, (uint32_t)attrs.size(), attrs.data());
-    if (status != SAI_STATUS_SUCCESS)
+    bool is_created = false;
+    if (status == SAI_STATUS_SUCCESS)
+    {
+        is_created = true;
+    }
+    else if (status == SAI_STATUS_ITEM_ALREADY_EXISTS)
+    {
+        /*
+         * Route already exists (e.g., previously programmed host route).
+         * Force it to CPU to preserve IP2ME semantics.
+         */
+        for (auto route_attr : attrs)
+        {
+            status = sai_route_api->set_route_entry_attribute(&unicast_route_entry, &route_attr);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("Failed to update existing IP2me route ip:%s attr:0x%x rv:%d",
+                               ip_prefix.getIp().to_string().c_str(), route_attr.id, status);
+                if (handleSaiSetStatus(SAI_API_ROUTE, status) != task_success)
+                {
+                    throw runtime_error("Failed to update existing IP2me route.");
+                }
+            }
+        }
+    }
+    else
     {
         SWSS_LOG_ERROR("Failed to create IP2me route ip:%s, rv:%d", ip_prefix.getIp().to_string().c_str(), status);
         if (handleSaiCreateStatus(SAI_API_ROUTE, status) != task_success)
@@ -1366,6 +1419,11 @@ void IntfsOrch::addIp2MeRoute(sai_object_id_t vrf_id, const IpPrefix &ip_prefix)
     }
 
     SWSS_LOG_NOTICE("Create IP2me route ip:%s", ip_prefix.getIp().to_string().c_str());
+
+    if (!is_created)
+    {
+        return;
+    }
 
     if (unicast_route_entry.destination.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
     {
@@ -1387,7 +1445,16 @@ void IntfsOrch::removeIp2MeRoute(sai_object_id_t vrf_id, const IpPrefix &ip_pref
     copy(unicast_route_entry.destination, ip_prefix.getIp());
 
     sai_status_t status = sai_route_api->remove_route_entry(&unicast_route_entry);
-    if (status != SAI_STATUS_SUCCESS)
+    bool is_removed = false;
+    if (status == SAI_STATUS_SUCCESS)
+    {
+        is_removed = true;
+    }
+    else if (status == SAI_STATUS_ITEM_NOT_FOUND)
+    {
+        SWSS_LOG_NOTICE("IP2me route ip:%s already removed", ip_prefix.getIp().to_string().c_str());
+    }
+    else
     {
         SWSS_LOG_ERROR("Failed to remove IP2me route ip:%s, rv:%d", ip_prefix.getIp().to_string().c_str(), status);
         if (handleSaiRemoveStatus(SAI_API_ROUTE, status) != task_success)
@@ -1398,16 +1465,22 @@ void IntfsOrch::removeIp2MeRoute(sai_object_id_t vrf_id, const IpPrefix &ip_pref
 
     SWSS_LOG_NOTICE("Remove packet action trap route ip:%s", ip_prefix.getIp().to_string().c_str());
 
-    if (unicast_route_entry.destination.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+    if (is_removed)
     {
-        gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV4_ROUTE);
-    }
-    else
-    {
-        gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV6_ROUTE);
+        if (unicast_route_entry.destination.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+        {
+            gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV4_ROUTE);
+        }
+        else
+        {
+            gCrmOrch->decCrmResUsedCounter(CrmResourceType::CRM_IPV6_ROUTE);
+        }
+
+        gFlowCounterRouteOrch->onRemoveMiscRouteEntry(vrf_id, IpPrefix(ip_prefix.getIp().to_string()));
     }
 
-    gFlowCounterRouteOrch->onRemoveMiscRouteEntry(vrf_id, IpPrefix(ip_prefix.getIp().to_string()));
+    gNeighOrch->restoreSuppressedNeighbors(ip_prefix.getIp(), vrf_id);
+    gRouteOrch->restoreConflictingHostRoute(vrf_id, ip_prefix.getIp());
 }
 
 void IntfsOrch::addDirectedBroadcast(const Port &port, const IpPrefix &ip_prefix)
@@ -1698,4 +1771,3 @@ void IntfsOrch::voqSyncDelIntf(string &alias)
 
     m_tableVoqSystemInterfaceTable->del(alias);
 }
-
